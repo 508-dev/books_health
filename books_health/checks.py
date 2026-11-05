@@ -37,6 +37,9 @@ def unapplied_payments(min_age_days=7):
 
     A client's payments once sat unapplied for ten months because their invoices were never created.
     The credit made later invoices look prepaid, which led to a discount for an overpayment that never happened.
+
+    The amount still open comes from the Payment Ledger, not the Payment Entry's unallocated_amount field:
+    when a payment is settled against another payment (a refund, say), ERPNext doesn't update that field.
     """
     rows = frappe.db.sql(
         """
@@ -49,6 +52,9 @@ def unapplied_payments(min_age_days=7):
         add_days(today(), -min_age_days),
         as_dict=True,
     )
+    still_open = _ledger_outstanding([pe.name for pe in rows])
+    rows = [pe.update(unallocated_amount=still_open.get(pe.name, 0)) for pe in rows]
+    rows = [pe for pe in rows if pe.unallocated_amount > 0.009]
     open_items = _open_invoice_totals()
     findings = []
     for pe in rows:
@@ -76,6 +82,24 @@ def unapplied_payments(min_age_days=7):
         findings.append(finding(severity, "Unapplied payments", "Payment Entry", pe.name, detail, pe.party,
                                 pe.unallocated_amount))
     return findings
+
+
+def _ledger_outstanding(payment_entries):
+    """Amount of each payment that is still unapplied, according to the Payment Ledger."""
+    if not payment_entries:
+        return {}
+    return {
+        row.name: abs(flt(row.outstanding))
+        for row in frappe.db.sql(
+            """
+            select against_voucher_no name, sum(amount) outstanding from `tabPayment Ledger Entry`
+            where delinked = 0 and against_voucher_type = 'Payment Entry' and against_voucher_no in %s
+            group by against_voucher_no
+            """,
+            [payment_entries],
+            as_dict=True,
+        )
+    }
 
 
 def _open_invoice_totals():
