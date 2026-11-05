@@ -1,0 +1,49 @@
+{% macro rows(items) %}
+<table style="border-collapse: collapse; width: 100%; font-size: 13px;">
+	<tr style="text-align: left; color: #6b7280;">
+		<th style="padding: 6px 8px;">Check</th>
+		<th style="padding: 6px 8px;">Document</th>
+		<th style="padding: 6px 8px;">Party</th>
+		<th style="padding: 6px 8px; text-align: right;">Amount</th>
+		<th style="padding: 6px 8px;">What's wrong</th>
+	</tr>
+	{% for f in items %}
+	<tr style="border-top: 1px solid #e5e7eb; vertical-align: top;">
+		<td style="padding: 6px 8px; white-space: nowrap;">{{ f.check }}</td>
+		<td style="padding: 6px 8px; white-space: nowrap;">
+			{% if f.url %}<a href="{{ f.url }}">{{ f.name }}</a>{% else %}{{ f.doctype }}{% endif %}
+		</td>
+		<td style="padding: 6px 8px;">{{ f.party or "" }}</td>
+		<td style="padding: 6px 8px; text-align: right; white-space: nowrap;">{{ f.amount_text }}</td>
+		<td style="padding: 6px 8px;">{{ f.detail }}</td>
+	</tr>
+	{% endfor %}
+</table>
+{% endmacro %}
+
+<div style="font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; color: #111827; max-width: 1000px;">
+	{% if not action and not review %}
+	<p>Nothing to fix or review this week.</p>
+	{% else %}
+	<p>
+		{% for check, n in counts.items() %}
+		<b>{{ check }}</b>: {% if n[ACTION] %}{{ n[ACTION] }} to fix{% endif %}{% if n[ACTION] and n[REVIEW] %}, {% endif %}{% if n[REVIEW] %}{{ n[REVIEW] }} to review{% endif %}<br>
+		{% endfor %}
+	</p>
+
+	{% if action %}
+	<h3 style="color: #b91c1c; margin-bottom: 4px;">To fix</h3>
+	<p style="margin-top: 0; color: #6b7280;">Money is probably misstated until these are sorted out.</p>
+	{{ rows(action) }}
+	{% if more_action %}<p>…and {{ more_action }} more.</p>{% endif %}
+	{% endif %}
+
+	{% if review %}
+	<h3 style="color: #b45309; margin-bottom: 4px;">To review</h3>
+	{{ rows(review) }}
+	{% if more_review %}<p>…and {{ more_review }} more.</p>{% endif %}
+	{% endif %}
+	{% endif %}
+
+	<p style="margin-top: 24px;"><a href="{{ report_url }}">Open the Books Health report</a> for the full list, including FYI items.</p>
+</div>
