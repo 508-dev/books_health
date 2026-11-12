@@ -4,7 +4,9 @@ Enable site config books_health_synthetic_tests=1 explicitly. Fixtures are
 ordinary ERP documents, rolled back after each test. No customer export is used.
 """
 
-from datetime import date
+from collections import Counter
+from datetime import date, datetime, timedelta
+import json
 import re
 import unittest
 import uuid
@@ -14,6 +16,13 @@ import frappe
 from frappe.utils import add_days, get_datetime, getdate, today
 
 from books_health import api, checks
+
+
+def deny_synthetic_invoice(doc, ptype, **kwargs):
+    """A real Frappe permission-hook target used by the disposable-site test."""
+    if ptype == "read" and doc.name == frappe.flags.get("books_health_denied_invoice"):
+        return False
+    return None
 
 
 class TestSyntheticHealthAPI(unittest.TestCase):
@@ -174,13 +183,84 @@ class TestSyntheticHealthAPI(unittest.TestCase):
             api.get_books_health(self.company.name, limit=1, offset=offset)
             for offset in range(first["total"])
         ]
-        keys = [
-            (page["findings"][0]["check_id"], page["findings"][0]["name"])
-            for page in pages
-        ]
-        self.assertEqual(len(keys), len(set(keys)))
-        self.assertIn(("overdue_invoices", self.overdue.name), keys)
+        whole = api.get_books_health(self.company.name, limit=200)
+        self.assertEqual(whole["total"], len(whole["findings"]))
+        rows = [page["findings"][0] for page in pages]
+        self.assertEqual(
+            Counter(json.dumps(row, sort_keys=True, default=str) for row in rows),
+            Counter(
+                json.dumps(row, sort_keys=True, default=str)
+                for row in whole["findings"]
+            ),
+        )
+        self.assertIn(
+            ("overdue_invoices", self.overdue.name),
+            [(row["check_id"], row["name"]) for row in rows],
+        )
         self.assertFalse(pages[-1]["has_more"])
+
+    def test_multiple_referral_findings_for_one_invoice_survive_pagination(self):
+        project = frappe.get_doc(
+            {
+                "doctype": "Project",
+                "project_name": f"{self.marker} Referrals",
+                "company": self.company.name,
+                "customer": self.customer.name,
+            }
+        ).insert()
+        invoice = self.invoice()
+        invoice.project = project.name
+        for item in invoice.items:
+            item.project = project.name
+        invoice.save()
+        invoice.submit()
+        # Referrers were added after submission, so no automated referral bills
+        # exist yet. Two genuine findings share the same check and document.
+        field = next(
+            df.fieldname
+            for df in project.meta.fields
+            if df.options == "Project Referrer"
+        )
+        suppliers = []
+        for index in (1, 2):
+            supplier = frappe.get_doc(
+                {
+                    "doctype": "Supplier",
+                    "supplier_name": f"{self.marker} Referrer {index}",
+                    "supplier_type": "Company",
+                    "country": self.company.country,
+                    "supplier_group": frappe.db.get_value(
+                        "Supplier Group", {"is_group": 0}, "name"
+                    )
+                    or "All Supplier Groups",
+                }
+            ).insert()
+            suppliers.append(supplier.name)
+            project.append(field, {"supplier": supplier.name, "percentage": index})
+        project.save()
+        whole = api.get_books_health(self.company.name, limit=200)
+        duplicate_keys = [
+            row
+            for row in whole["findings"]
+            if row["check_id"] == "referral_fees" and row["name"] == invoice.name
+        ]
+        self.assertCountEqual(
+            [(row["party"], row["amount"]) for row in duplicate_keys],
+            [(suppliers[0], 1), (suppliers[1], 2)],
+        )
+        pages = [
+            api.get_books_health(self.company.name, limit=1, offset=offset)["findings"][
+                0
+            ]
+            for offset in range(whole["total"])
+        ]
+        self.assertEqual(
+            Counter(
+                json.dumps(row, sort_keys=True, default=str)
+                for row in whole["findings"]
+            ),
+            Counter(json.dumps(row, sort_keys=True, default=str) for row in pages),
+        )
 
     def test_successful_read_has_no_database_or_email_effects(self):
         sources = (*api.SOURCE_DOCTYPES, "Error Log", "Email Queue", "Communication")
@@ -244,6 +324,93 @@ class TestSyntheticHealthAPI(unittest.TestCase):
         with self.assertRaises(frappe.PermissionError):
             api.get_books_health(self.company.name)
         self.assertEqual(frappe.response["error_code"], "forbidden")
+
+    def test_record_hook_denial_is_not_hidden_by_equal_list_counts(self):
+        user = self.finance_user()
+        original_get_hooks = frappe.get_hooks
+
+        def get_hooks(hook=None, *args, **kwargs):
+            hooks = original_get_hooks(hook, *args, **kwargs)
+            if hook == "has_permission":
+                return {
+                    **hooks,
+                    "Sales Invoice": [
+                        *hooks.get("Sales Invoice", []),
+                        "books_health.tests.test_api_synthetic.deny_synthetic_invoice",
+                    ],
+                }
+            return hooks
+
+        frappe.flags.books_health_denied_invoice = self.overdue.name
+        self.addCleanup(frappe.flags.pop, "books_health_denied_invoice", None)
+        frappe.set_user(user.name)
+        with patch.object(frappe, "get_hooks", side_effect=get_hooks):
+            self.assertFalse(
+                frappe.has_permission("Sales Invoice", "read", doc=self.overdue.name)
+            )
+            self.assertTrue(
+                frappe.has_permission("Sales Invoice", "read", doc=self.drafts[0].name)
+            )
+            visible = frappe.get_list(
+                "Sales Invoice",
+                fields=["count(name) as total"],
+                order_by="",
+                limit_page_length=1,
+            )
+            self.assertEqual(visible[0].total, frappe.db.count("Sales Invoice"))
+            with patch.object(checks, "run_all") as scan:
+                with self.assertRaises(frappe.PermissionError):
+                    api.get_books_health(self.company.name)
+                scan.assert_not_called()
+            self.assertEqual(frappe.response["error_code"], "forbidden")
+
+    def finance_user(self):
+        return frappe.get_doc(
+            {
+                "doctype": "User",
+                "email": f"health-{uuid.uuid4().hex}@example.invalid",
+                "first_name": "Synthetic Finance Reader",
+                "send_welcome_email": 0,
+                "roles": [{"role": "Accounts Manager"}],
+            }
+        ).insert()
+
+    def test_hidden_outstanding_amount_is_denied_even_with_document_read(self):
+        user = self.finance_user()
+        frappe.get_doc(
+            {
+                "doctype": "Property Setter",
+                "doctype_or_field": "DocField",
+                "doc_type": "Sales Invoice",
+                "field_name": "outstanding_amount",
+                "property": "permlevel",
+                "property_type": "Int",
+                "value": "9",
+            }
+        ).insert()
+        frappe.clear_cache(doctype="Sales Invoice")
+        frappe.set_user(user.name)
+        self.assertTrue(
+            frappe.has_permission("Sales Invoice", "read", doc=self.overdue.name)
+        )
+        permitted = frappe.get_meta("Sales Invoice").get_permitted_fieldnames(
+            user=user.name,
+            permission_type="read",
+            with_virtual_fields=False,
+        )
+        self.assertNotIn("outstanding_amount", permitted)
+        with self.assertRaises(frappe.PermissionError):
+            api.require_field_access("Sales Invoice")
+        with patch.object(checks, "run_all") as scan:
+            with self.assertRaises(frappe.PermissionError):
+                api.get_books_health(self.company.name)
+            scan.assert_not_called()
+        self.assertEqual(frappe.response["error_code"], "forbidden")
+
+    def test_generated_at_is_timezone_aware_utc(self):
+        result = api.get_books_health(self.company.name)
+        timestamp = datetime.fromisoformat(result["generated_at"])
+        self.assertEqual(timestamp.utcoffset(), timedelta(0))
 
     def test_actual_foreign_currency_document_is_rejected(self):
         draft = frappe.get_doc("Sales Invoice", self.drafts[0].name)

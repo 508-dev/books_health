@@ -5,7 +5,9 @@ Database and framework permission behavior still require the Bench suite.
 """
 
 import importlib
-from datetime import datetime
+from collections import Counter
+from datetime import datetime, timedelta
+import json
 from pathlib import Path
 import sys
 from types import ModuleType, SimpleNamespace
@@ -47,9 +49,26 @@ class TestHealthAPI(unittest.TestCase):
             return_value=[Row(name="Co", default_currency="USD")]
         )
         frappe.get_list = MagicMock(return_value=[Row(total=2)])
-        frappe.get_meta = MagicMock(
-            return_value=SimpleNamespace(has_field=lambda field: True)
-        )
+        self.metadata = {}
+
+        def get_meta(doctype):
+            if doctype not in self.metadata:
+                meta = SimpleNamespace(fields=[])
+                meta.has_field = lambda field: True
+                meta.get_fieldnames_with_value = lambda **kwargs: [
+                    field.fieldname
+                    for field in meta.fields
+                    if field.fieldtype != "Table"
+                ]
+                meta.get_permitted_fieldnames = lambda **kwargs: [
+                    field.fieldname for field in meta.fields if not field.permlevel
+                ]
+                meta.get_permlevel_access = lambda **kwargs: [0]
+                self.metadata[doctype] = meta
+            return self.metadata[doctype]
+
+        frappe.get_meta = MagicMock(side_effect=get_meta)
+        frappe.get_hooks = MagicMock(return_value={})
         frappe.db = SimpleNamespace(
             count=MagicMock(return_value=2), exists=MagicMock(return_value=False)
         )
@@ -164,6 +183,49 @@ class TestHealthAPI(unittest.TestCase):
         self.assertIn("Deleted Document", checked)
         self.assertIn("Payment Ledger Entry", checked)
 
+    def test_source_record_hooks_cannot_be_bypassed_by_equal_counts(self):
+        self.frappe.get_hooks.return_value = {"Sales Invoice": ["custom.permission"]}
+        self.assert_error("forbidden", PermissionError)
+        self.frappe.get_all.assert_not_called()
+
+    def test_wildcard_or_child_record_hooks_fail_closed(self):
+        for doctype in ("*", "Timesheet Detail", "Project Referrer"):
+            with self.subTest(doctype=doctype):
+                self.frappe.get_hooks.return_value = {doctype: ["custom.permission"]}
+                self.assert_error("forbidden", PermissionError)
+
+    def test_hidden_outstanding_amount_is_denied_despite_row_access(self):
+        self.frappe.get_meta("Sales Invoice").fields = [
+            Row(
+                fieldname="outstanding_amount",
+                fieldtype="Currency",
+                permlevel=9,
+            )
+        ]
+        self.assert_error("forbidden", PermissionError)
+        self.frappe.get_all.assert_not_called()
+
+    def test_hidden_secondary_child_field_is_denied(self):
+        self.frappe.get_meta("Sales Invoice Item").fields = [
+            Row(
+                fieldname="rate",
+                fieldtype="Currency",
+                permlevel=9,
+            )
+        ]
+        self.assert_error("forbidden", PermissionError)
+
+    def test_hidden_parent_table_is_denied_even_when_child_fields_are_readable(self):
+        self.frappe.get_meta("Sales Invoice").fields = [
+            Row(
+                fieldname="timesheets",
+                fieldtype="Table",
+                options="Sales Invoice Timesheet",
+                permlevel=9,
+            )
+        ]
+        self.assert_error("forbidden", PermissionError)
+
     def test_invalid_page_arguments_never_scan(self):
         for kwargs in (
             {"limit": 0},
@@ -185,7 +247,9 @@ class TestHealthAPI(unittest.TestCase):
         self.scan.assert_called_once_with(include_info=False, log_errors=False)
         self.assertEqual(result["currency"], "USD")
         self.assertEqual(result["status"], "complete")
-        self.assertEqual(result["generated_at"], "2026-11-13T07:00:00")
+        self.assertEqual(
+            datetime.fromisoformat(result["generated_at"]).utcoffset(), timedelta(0)
+        )
 
     def test_nonboolean_info_flag_rejected(self):
         self.assert_error("invalid_argument", include_info=1.0)
@@ -231,6 +295,38 @@ class TestHealthAPI(unittest.TestCase):
         result = self.api.get_books_health("Co", limit=1)
         self.assertEqual(result["status"], "partial_failure")
         self.assertEqual(result["failed_checks"], ["check_2"])
+
+    def test_pagination_preserves_multiple_findings_for_the_same_check_and_document(
+        self,
+    ):
+        base = dict(
+            severity=self.checks.ACTION,
+            severity_code="action",
+            check_id="referral_fees",
+            doctype="Sales Invoice",
+            name="INV-1",
+            detail="Missing referral bill.",
+        )
+        self.scan.return_value = [
+            Row(**base, party="Referrer B", amount=20),
+            Row(**base, party="Referrer A", amount=10),
+            Row(**base, party="Referrer A", amount=10),
+        ]
+        whole = self.api.get_books_health("Co", limit=200)
+        pages = [self.api.get_books_health("Co", limit=1, offset=i) for i in range(3)]
+
+        def identity(row):
+            return json.dumps(row, sort_keys=True)
+
+        self.assertEqual(
+            Counter(map(identity, whole["findings"])),
+            Counter(identity(page["findings"][0]) for page in pages),
+        )
+        self.assertEqual(whole["total"], 3)
+        self.assertEqual(
+            [page["findings"][0]["party"] for page in pages],
+            ["Referrer A", "Referrer A", "Referrer B"],
+        )
 
     def test_manual_digest_requires_post_and_source_authorization(self):
         digest = importlib.import_module("books_health.digest")

@@ -4,10 +4,11 @@ The existing checks intentionally inspect the whole ledger. Until they support
 scoped aggregates, the API fails closed for restricted readers or mixed scopes.
 """
 
+from datetime import datetime, timezone
+import json
 import re
 
 import frappe
-from frappe.utils import now_datetime
 
 from books_health import checks
 
@@ -28,6 +29,15 @@ SOURCE_DOCTYPES = (
     "Account",
     "GL Entry",
     "Deleted Document",
+)
+# These child tables contribute SQL filters, amounts or linked-document details.
+# Their field permissions inherit the specified parent's permission levels.
+CHILD_SOURCES = (
+    ("Sales Invoice Item", "Sales Invoice"),
+    ("Sales Invoice Timesheet", "Sales Invoice"),
+    ("Timesheet Detail", "Timesheet"),
+    ("Project Referrer", "Project"),
+    ("Bank Transaction Payments", "Bank Transaction"),
 )
 CURRENCY_FIELDS = {
     "Sales Invoice": ("currency",),
@@ -50,6 +60,71 @@ def fail(code, message, permission=False):
     )
 
 
+def require_field_access(doctype, parenttype=None):
+    """Require full source-field access before SQL can bypass field filtering.
+
+    Deliberately authorize every persisted field rather than maintaining a
+    fragile partial list of the fields used by checks and secondary aggregates.
+    Administrator bypasses field restrictions in Frappe itself.
+    """
+    if frappe.session.user == "Administrator":
+        return
+    meta = frappe.get_meta(doctype)
+    required = set(meta.get_fieldnames_with_value(with_virtual_fields=False))
+    permitted = set(
+        meta.get_permitted_fieldnames(
+            parenttype=parenttype,
+            user=frappe.session.user,
+            permission_type="read",
+            with_virtual_fields=False,
+        )
+    )
+    if required - permitted:
+        fail(
+            "forbidden",
+            "Books Health requires unrestricted read access to source fields.",
+            permission=True,
+        )
+    if parenttype:
+        parent = frappe.get_meta(parenttype)
+        levels = set(
+            parent.get_permlevel_access(
+                permission_type="read", user=frappe.session.user
+            )
+        )
+        # Table fields are omitted by get_fieldnames_with_value. Hiding the
+        # parent table must also hide the child amounts read directly by SQL.
+        for field in parent.fields:
+            if (
+                field.fieldtype in ("Table", "Table MultiSelect")
+                and field.options == doctype
+            ):
+                if (field.permlevel or 0) not in levels:
+                    fail(
+                        "forbidden",
+                        "Books Health requires unrestricted read access to source tables.",
+                        permission=True,
+                    )
+
+
+def require_source_access():
+    hooks = frappe.get_hooks("has_permission")
+    sources = set(SOURCE_DOCTYPES) | {doctype for doctype, _parent in CHILD_SOURCES}
+    # get_list applies query restrictions, but it does not evaluate per-document
+    # has_permission hooks. Reject these configurations rather than leaking
+    # denied records through a whole-ledger scan whose counts happen to match.
+    if hooks.get("*") or any(hooks.get(doctype) for doctype in sources):
+        fail(
+            "forbidden",
+            "Books Health does not support custom source permission hooks.",
+            permission=True,
+        )
+    for doctype in SOURCE_DOCTYPES:
+        require_field_access(doctype)
+    for doctype, parenttype in CHILD_SOURCES:
+        require_field_access(doctype, parenttype)
+
+
 def authorized_scope(company=None):
     """Authorize every source before global checks can expose linked data/totals.
 
@@ -64,6 +139,7 @@ def authorized_scope(company=None):
         )
     if company is not None and (not isinstance(company, str) or not company.strip()):
         fail("invalid_argument", "company must be a nonempty Company name.")
+    require_source_access()
     companies = frappe.get_all(
         "Company", fields=["name", "default_currency"], limit_page_length=2
     )
@@ -155,15 +231,6 @@ def get_books_health(company, include_info=False, limit=50, offset=0):
     findings = checks.run_all(include_info=include_info, log_errors=False)
     # A deterministic secondary sort makes pages reproducible when severity
     # and check match; callers should refresh after underlying records change.
-    findings.sort(
-        key=lambda row: (
-            checks.SEVERITY_ORDER[row.severity],
-            row.check_id,
-            row.doctype or "",
-            row.name or "",
-            row.detail,
-        )
-    )
     failed_checks = sorted({row.check_id for row in findings if row.get("error_code")})
     rows = [
         {
@@ -177,15 +244,25 @@ def get_books_health(company, include_info=False, limit=50, offset=0):
             "detail": row.detail,
             "error_code": row.get("error_code"),
         }
-        for row in findings[offset : offset + limit]
+        for row in findings
     ]
+    severity_order = {"action": 0, "review": 1, "info": 2}
+    rows.sort(
+        key=lambda row: (
+            severity_order[row["severity"]],
+            row["check_id"],
+            row["doctype"] or "",
+            row["name"] or "",
+            json.dumps(row, sort_keys=True, default=str),
+        )
+    )
     return {
         "api_version": 1,
         **scope,
-        "generated_at": now_datetime().isoformat(),
+        "generated_at": datetime.now(timezone.utc).isoformat(),
         "status": "partial_failure" if failed_checks else "complete",
         "failed_checks": failed_checks,
-        "findings": rows,
+        "findings": rows[offset : offset + limit],
         "total": len(findings),
         "limit": limit,
         "offset": offset,

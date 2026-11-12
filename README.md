@@ -89,7 +89,7 @@ The result is in Frappe's normal `message` envelope:
     "api_version": 1,
     "company": "Example Company",
     "currency": "USD",
-    "generated_at": "2026-11-13T07:00:00",
+    "generated_at": "2026-11-13T07:00:00+00:00",
     "status": "complete",
     "failed_checks": [],
     "findings": [
@@ -113,7 +113,7 @@ The result is in Frappe's normal `message` envelope:
 }
 ```
 
-`generated_at` uses the site's time zone. The stable severity values are
+`generated_at` is a timezone-aware UTC timestamp. The stable severity values are
 `action`, `review` and `info`. Check IDs are `unapplied_payments`,
 `negative_cash_and_bank`, `payments_without_bank_lines`, `unbilled_hours`,
 `hours_without_timesheets`, `referral_fees`, `stale_drafts`, `bank_backlog`,
@@ -143,7 +143,18 @@ deliberately rejects that account until its source access is authorized. A prima
 finding can describe other documents or party-wide totals, so checking only its
 primary document would disclose data to restricted readers. The API checks
 source DocType permissions and permission-filtered source counts before it
-runs any checks. Users with limited document access are rejected in full;
+runs any checks. Because those counts do not evaluate per-record permission
+hooks, the API rejects configured `has_permission` hooks on any source DocType
+or on `*`. Custom hooks must be supported through explicit per-record
+authorization before that configuration can use the whole-ledger API.
+
+The API also requires read access to **every persisted source field**, including
+child-table fields and their parent table's permission level. This conservative
+rule covers fields used in filters, SQL aggregates and explanatory text as well
+as the primary amount. It may reject an account whose hidden fields are not
+currently used by a check. Administrator retains Frappe's field-access bypass;
+custom permission-hook configurations are rejected for every user.
+Users with limited document or field access are rejected in full;
 results are never silently filtered into an incomplete health report.
 
 The checks currently aggregate the whole site and format dollars. The API
