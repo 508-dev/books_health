@@ -25,6 +25,12 @@ class TestChecksRun(unittest.TestCase):
         order = [checks.SEVERITY_ORDER[f.severity] for f in checks.run_all(include_info=True)]
         self.assertEqual(order, sorted(order))
 
+    def test_api_identifiers_are_registered_and_stable(self):
+        self.assertEqual(set(checks.CHECKS), set(checks.CHECK_IDS))
+        for row in checks.run_all(include_info=True):
+            self.assertIn(row.check_id, checks.CHECK_IDS.values())
+            self.assertIn(row.severity_code, {"action", "review", "info"})
+
     def test_a_failing_check_is_reported_not_raised(self):
         def broken():
             raise RuntimeError("intentional failure")
