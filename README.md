@@ -40,6 +40,19 @@ bench --site <site> migrate   # syncs the report definition
 
 ## Tests
 
+Synthetic data also works: no production export is needed. On an explicitly
+enabled disposable, single-company USD ERPNext site with `referral_fee` installed,
+set `books_health_synthetic_tests=1` and run
+`books_health.tests.test_api_synthetic`. Its six real-site tests create and roll
+back an overdue invoice and stale drafts, and verify pagination, source
+permissions, foreign-currency rejection and SQL/email read-only behavior.
+
+The combined [Books Assistant synthetic runner](https://github.com/508-dev/books_assistant/blob/feat/integration-api-hardening/books_assistant/tests/README.md)
+provides setup masters and raises on test failures or skips (some Bench versions
+return exit status zero despite a printed failed suite). Verified with ERPNext
+15.124.5, Frappe 15.126.1, MariaDB 10.6 and Redis 7; all six health integration
+tests passed alongside the 19 standalone contract tests.
+
 ```bash
 bench --site <site> run-tests --app books_health
 ```
