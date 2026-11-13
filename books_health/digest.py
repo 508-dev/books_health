@@ -52,11 +52,8 @@ def send_weekly_digest():
     frappe.sendmail(recipients=to, subject=subject, message=message)
 
 
-@frappe.whitelist(methods=["POST"])
+@frappe.whitelist()
 def send_digest_now():
     frappe.only_for(("Accounts Manager", "System Manager"))
-    from books_health.api import authorized_scope
-
-    authorized_scope()
     subject, message = build_digest()
     frappe.sendmail(recipients=[frappe.session.user], subject=subject, message=message, now=True)
