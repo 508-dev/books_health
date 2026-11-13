@@ -14,7 +14,6 @@ REVIEW = "Review"  # worth a look; may be fine
 INFO = "FYI"
 
 SEVERITY_ORDER = {ACTION: 0, REVIEW: 1, INFO: 2}
-SEVERITY_CODES = {ACTION: "action", REVIEW: "review", INFO: "info"}
 
 HOURLY_SALES_ITEM = "Contract Engineering (Sales)"
 MARGIN_TARGET_PCT = 5
@@ -29,8 +28,7 @@ def money(amount) -> str:
 
 def finding(severity, check, doctype, name, detail, party=None, amount=None):
     return frappe._dict(
-        severity=severity, severity_code=SEVERITY_CODES[severity], check=check,
-        doctype=doctype, name=name, party=party, amount=amount, detail=detail
+        severity=severity, check=check, doctype=doctype, name=name, party=party, amount=amount, detail=detail
     )
 
 
@@ -518,43 +516,19 @@ CHECKS = [
     thin_margins,
 ]
 
-# Public action identifiers are explicit: renaming a function or translating a
-# display label must not change the API contract.
-CHECK_IDS = {
-    unapplied_payments: "unapplied_payments",
-    negative_cash_and_bank: "negative_cash_and_bank",
-    payments_without_bank_lines: "payments_without_bank_lines",
-    unbilled_timesheets: "unbilled_hours",
-    hours_without_timesheets: "hours_without_timesheets",
-    referral_fees: "referral_fees",
-    stale_drafts: "stale_drafts",
-    bank_backlog: "bank_backlog",
-    overdue_invoices: "overdue_invoices",
-    thin_margins: "thin_margins",
-}
 
-
-def run_all(include_info=False, log_errors=True):
+def run_all(include_info=False):
     """Run every check. A failing check is reported as a finding rather than hiding the others."""
     findings = []
     for check in CHECKS:
-        check_id = CHECK_IDS.get(check, "unregistered_check")
         try:
-            rows = check()
-            for row in rows:
-                row.check_id = check_id
-            findings.extend(rows)
+            findings.extend(check())
         except Exception:
-            if log_errors:
-                frappe.log_error(title=f"books_health: {check.__name__} failed")
-            diagnostic = "see the Error Log" if log_errors else "run the ERP report to record diagnostics"
-            error = finding(
+            frappe.log_error(title=f"books_health: {check.__name__} failed")
+            findings.append(finding(
                 ACTION, "Health check error", "Error Log", None,
-                f"The {check.__name__} check failed to run; {diagnostic}.",
-            )
-            error.check_id = check_id
-            error.error_code = "check_failed"
-            findings.append(error)
+                f"The {check.__name__} check failed to run; see the Error Log.",
+            ))
     if not include_info:
         findings = [f for f in findings if f.severity != INFO]
     findings.sort(key=lambda f: (SEVERITY_ORDER[f.severity], f.check))
